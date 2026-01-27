@@ -3,27 +3,24 @@ from __future__ import annotations
 import os
 import json
 import warnings
-from typing import List, Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
-import torch
 
 import optuna
 import mlflow
 
-from ECGlabeling import ECGlabeling
-
-from monipy.data.FeatureTable2 import FeatureTable as ft
 from monipy.data.SeizureEvaluation import SeizureEvaluation
-from monipy.data.Detection import Detection
 from monipy.models.tsai_models import ClassifierModel
-
 import monipy.utils.detection_utils as detection_utils
+from monipy.data.FeatureTable2 import FeatureTable
 
 from reproducibility import set_global_seed
 
-
+# ---------------------------------------------------------------------
+# GLOBAL SETUP
+# ---------------------------------------------------------------------
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -31,127 +28,100 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 set_global_seed(42, deterministic=True)
 
+EVAL_WINDOW_SECONDS = 300
+SECONDS_PER_DAY = 86400.0
+QUALITY_THRESHOLD = 1
 
-
-EVAL_WINDOW_SECONDS: int = 300
-SECONDS_PER_DAY: float = 86400.0
-
-FEATURE_NAMES: List[str] = [
-    "avg","sd","rmssd","rmssd_dt","skew","kurt","pnnx","nnx","triangular_index",
-    "quantile_25","quantile_50","quantile_75","variance","csi","csim","cvi",
-    "sd1","sd2","csi_slope","csim_slope","csi_filtered","csim_filtered",
-    "csi_filtered_slope","csim_filtered_slope","hr_diff","hr_diff_slope",
-    "hr_diff_filtered","hr_diff_filtered_slope"
-]
-
-def feature_to_index(name: str) -> int:
-    return FEATURE_NAMES.index(name)
-
-
+# ---------------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------------
 class Manager:
     def __init__(self, base_dir: str) -> None:
-        self.base_dir: str = base_dir
-        self.seizures_info: Dict[str, Dict] = self._load_seizures_info()
-        self.seizure_ids: List[str] = list(self.seizures_info.keys())
+        self.base_dir = base_dir
+        self.seizures_info = self._load_seizures_info()
 
     def _load_seizures_info(self) -> Dict[str, Dict]:
         path = os.path.join(self.base_dir, "seizures_details.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
         with open(path, "r") as f:
             return json.load(f)
-
-    def load_ecg(self, path: str) -> ECGlabeling:
-        ecg = ECGlabeling()
-        ecg.load_data(path)
-        return ecg
-
-    def get_rr(
-        self, ecg: ECGlabeling
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        ts = pd.to_datetime(ecg.ts)
-        r_peaks_s = ecg.r_peaks / ecg.frequency
-        r_times = ts[0] + pd.to_timedelta(r_peaks_s, unit="s")
-        return np.diff(r_peaks_s) * 1000, r_times[1:]
 
 
 def create_records(manager: Manager) -> Dict[str, Dict]:
     records: Dict[str, Dict] = {}
-    seen: set[str] = set()
-
     for sid, info in manager.seizures_info.items():
-        start = info["record_start_sen"]
-        if start in seen:
-            continue
-        seen.add(start)
-
-        records[start] = {
-            "record_start": np.datetime64(info["record_start_sen"]),
-            "record_end": np.datetime64(info["record_end_sen"]),
-            "patient_id": info["patient_id"],
-            "seizures": []
-        }
-
-    for sid, info in manager.seizures_info.items():
-        records[info["record_start_sen"]]["seizures"].append(sid)
-
+        rid = info["record_start_sen"]
+        if rid not in records:
+            records[rid] = {
+                "record_id": rid,
+                "patient_id": info["patient_id"],
+                "record_start": np.datetime64(info["record_start_sen"]),
+                "record_end": np.datetime64(info["record_end_sen"]),
+                "seizures": [],
+            }
+        records[rid]["seizures"].append(sid)
     return records
 
 
-def get_pat_sei_stats(
-    seizure_df: pd.DataFrame,
-    patient_id: str | int
-) -> Tuple[int, int]:
-    df = seizure_df[seizure_df["patient_id"] == patient_id]
-    counts = df["is_detected"].value_counts()
-    tp = int(counts.get(True, 0))
-    fn = int(counts.get(False, 0))
-    return tp, fn
+def build_grouped_from_base_dir(base_dir: str) -> Dict:
+    manager = Manager(base_dir)
+    records = create_records(manager)
 
-def compute_patient_metrics(
-    patient_id: str | int,
-    detection_df: pd.DataFrame,
-    seizure_df: pd.DataFrame
-) -> Tuple[float, int, int, int, int, float, float, float, float]:
-    det = detection_df[detection_df["patient_id"] == patient_id]
-    sei = seizure_df[seizure_df["patient_id"] == patient_id]
+    grouped: Dict = {}
+    for rid, rec in records.items():
+        pid = rec["patient_id"]
+        grouped.setdefault(pid, {})
+        grouped[pid][rid] = rec
+    return grouped
 
-    total_seconds = det["record_duration"].sum() / np.timedelta64(1, "s")
-    duration_hours = total_seconds / 3600.0
-    duration_days = total_seconds / SECONDS_PER_DAY
+# ---------------------------------------------------------------------
+# DEFICIENCY
+# ---------------------------------------------------------------------
+def compute_deficiency(feature_table: FeatureTable, quality_threshold: int) -> np.timedelta64:
+    bad = feature_table.filter_table["quality"] < quality_threshold
+    if not bad.any():
+        return np.timedelta64(0, "s")
 
-    n_seizures = len(sei)
-    tp, fn = get_pat_sei_stats(seizure_df, patient_id)
-    fp = int(det["fp"].sum())
+    width = feature_table.ALL_FEATURES_WINDOW_WIDTH
+    idx = np.where(bad.to_numpy())[0]
 
-    far24 = fp / duration_days if duration_days > 0 else 0.0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    sen = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * ppv * sen / (ppv + sen) if (ppv + sen) > 0 else 0.0
+    total = np.timedelta64(0, "s")
+    start = idx[0]
+    prev = idx[0]
 
-    return duration_hours, n_seizures, tp, fp, fn, far24, ppv, sen, f1
+    for i in idx[1:]:
+        if i != prev + 1:
+            t0 = feature_table.row_to_timestamp(start)
+            t1 = feature_table.row_to_timestamp(prev) + np.timedelta64(width, "s")
+            total += (t1 - t0)
+            start = i
+        prev = i
 
+    t0 = feature_table.row_to_timestamp(start)
+    t1 = feature_table.row_to_timestamp(prev) + np.timedelta64(width, "s")
+    total += (t1 - t0)
 
-def evaluate_detections_on_record(
-    record_id: str,
-    detections: List[Detection],
-    info_df: pd.DataFrame,
-    onset_col: str,
-    offset_col: str
-) -> Tuple[List[SeizureEvaluation], List[Detection]]:
-    seizures: List[SeizureEvaluation] = []
+    return total
 
+# ---------------------------------------------------------------------
+# SEIZURE + DETECTION EVALUATION
+# ---------------------------------------------------------------------
+def evaluate_detections_on_record(record_id, detections, info_df, onset_col, offset_col):
+    seizures = []
     rec_df = info_df[info_df["record_id"] == record_id]
 
     for _, row in rec_df.iterrows():
-        seizure = SeizureEvaluation(
+        s = SeizureEvaluation(
             record_id,
             row["seizure_id"],
             np.datetime64(row[onset_col]),
             np.datetime64(row[offset_col]),
             {},
         )
-        seizure.patient_id = row["patient_id"]
-        seizure.is_detected = False
-        seizures.append(seizure)
+        s.patient_id = row["patient_id"]
+        s.is_detected = False
+        seizures.append(s)
 
     for d in detections:
         d.set_status("fp")
@@ -166,135 +136,137 @@ def evaluate_detections_on_record(
 
     return seizures, detections
 
+# ---------------------------------------------------------------------
+# TABLE BUILDERS
+# ---------------------------------------------------------------------
+def build_sec_evalu(seizures):
+    return pd.DataFrame([{
+        "patient_id": s.patient_id,
+        "record_id": s.record_id,
+        "seizure_id": s.seizure_id,
+        "is_detected": s.is_detected,
+    } for s in seizures])
 
+
+def build_detection_results(detections, patient_id, record_id):
+    return pd.DataFrame([{
+        "patient_id": patient_id,
+        "record_id": record_id,
+        "result": d.get_status(),
+    } for d in detections])
+
+
+def build_first_evalu(sec_df, det_df, record_start, record_end):
+    ft = FeatureTable(record_start, record_end)
+    deficiency = compute_deficiency(ft, QUALITY_THRESHOLD)
+
+    duration = record_end - record_start
+    fp = (det_df["result"] == "fp").sum()
+    tp = (det_df["result"] == "tp").sum()
+
+    return pd.DataFrame([{
+        "patient_id": sec_df.patient_id.iloc[0],
+        "record_id": sec_df.record_id.iloc[0],
+        "record_duration": duration,
+        "deficiency": deficiency,
+        "n_det_fp": fp,
+        "n_det_tp": tp,
+    }])
+
+# ---------------------------------------------------------------------
+# MODEL EVALUATION
+# ---------------------------------------------------------------------
 def evaluate_model_on_data_package(
-    model: ClassifierModel,
-    data: np.ndarray,
-    labels: np.ndarray,
-    meta_df: pd.DataFrame,
-    grouped_records: Dict,
-    threshold: float,
-    onset_col: str,
-    offset_col: str
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    seizure_rows: List[Dict] = []
-    detection_rows: List[Dict] = []
-
+    model,
+    data,
+    labels,
+    meta_df,
+    grouped,
+    threshold,
+    onset_col,
+    offset_col,
+):
     preds = model.predict(data)
 
-    detections = detection_utils.get_detections(
-        predictions=preds,
-        threshold=threshold
-    )
+    # Window-level detections reused per record (intentional simplification)
+    detections = detection_utils.get_detections(preds, threshold)
 
-    for patient_id, records in grouped_records.items():
-        for record_id in records.keys():
+    all_sec, all_first, all_det = [], [], []
+
+    for pid, records in grouped.items():
+        for rid, rec in records.items():
             seizures, dets = evaluate_detections_on_record(
-                record_id,
-                detections,
-                meta_df,
-                onset_col,
-                offset_col,
+                rid, detections, meta_df, onset_col, offset_col
             )
 
-            for s in seizures:
-                seizure_rows.append({
-                    "patient_id": patient_id,
-                    "record_id": record_id,
-                    "seizure_id": s.seizure_id,
-                    "is_detected": s.is_detected,
-                })
+            sec = build_sec_evalu(seizures)
+            det = build_detection_results(dets, pid, rid)
+            first = build_first_evalu(
+                sec, det, rec["record_start"], rec["record_end"]
+            )
 
-            fp = sum(d.get_status() == "fp" for d in dets)
-            detection_rows.append({
-                "patient_id": patient_id,
-                "record_id": record_id,
-                "fp": fp,
-                "record_duration": np.timedelta64(1, "D"),
-            })
+            all_sec.append(sec)
+            all_det.append(det)
+            all_first.append(first)
 
-    return pd.DataFrame(seizure_rows), pd.DataFrame(detection_rows)
-
-def model_performance(
-    seizure_df: pd.DataFrame,
-    detection_df: pd.DataFrame
-) -> pd.DataFrame:
-    rows = []
-    for pid in seizure_df["patient_id"].unique():
-        rows.append((pid, *compute_patient_metrics(pid, detection_df, seizure_df)))
-
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "patient_id","duration_h","n_seizures",
-            "tp","fp","fn","far24","ppv","sen","f1",
-        ],
+    return (
+        pd.concat(all_sec, ignore_index=True),
+        pd.concat(all_first, ignore_index=True),
+        pd.concat(all_det, ignore_index=True),
     )
 
+# ---------------------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------------------
+def compute_patient_metrics(pid, records_df, seizures_df):
+    rec = records_df[records_df.patient_id == pid]
+    sei = seizures_df[seizures_df.patient_id == pid]
 
-def objective(
-    trial: optuna.Trial,
-    data: np.ndarray,
-    labels: np.ndarray,
-    meta_df: pd.DataFrame,
-    grouped: Dict,
-) -> Tuple[float, float]:
-    config = {
-        "model_name": "TransformerClassifier",
-        "input_shape": (data.shape[1], data.shape[2]),
-        "nb_classes": 1,
-        "epochs": trial.suggest_int("epochs", 10, 30),
-        "batch_size": trial.suggest_categorical("batch_size", [16, 32, 64]),
-        "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
-        "prediction_threshold": trial.suggest_float("threshold", 0.3, 0.9),
+    duration_days = rec.record_duration.sum() / np.timedelta64(1, "D")
+    tp = int(sei.is_detected.sum())
+    fn = int((~sei.is_detected).sum())
+    fp = int(rec.n_det_fp.sum())
+
+    ppv = tp / (tp + fp) if (tp + fp) else 0.0
+    sen = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * ppv * sen / (ppv + sen) if (ppv + sen) else 0.0
+    far = fp / duration_days if duration_days else 0.0
+
+    return tp, fp, fn, ppv, sen, f1, far
+
+
+def compute_cohort_metrics(seizures, records):
+    rows = []
+    for pid in records.patient_id.unique():
+        rows.append((pid, *compute_patient_metrics(pid, records, seizures)))
+
+    df = pd.DataFrame(rows, columns=[
+        "patient_id","TP","FP","FN","PPV","Sensitivity","F1","FAR"
+    ])
+
+    return {
+        "Total_Sensitivity": df.TP.sum() / (df.TP.sum() + df.FN.sum()) * 100,
+        "Total_FAR": df.FP.sum() / (records.record_duration.sum() / np.timedelta64(1, "D")),
+        "med_F1": df.F1.median(),
+        "med_FAR": df.FAR.median(),
+        "med_FP": df.FP.median(),
+        "med_PPV": df.PPV.median(),
+        "N_tp": df.TP.sum(),
+        "N_fp": df.FP.sum(),
+        "N_fn": df.FN.sum(),
+        "n_seizures": len(seizures),
     }
 
-    model = ClassifierModel(config)
+# ---------------------------------------------------------------------
+# RUNNER
+# ---------------------------------------------------------------------
+def run_experiment(data, labels, meta_df, base_dir):
+    mlflow.set_experiment("simplified_experiment")
+    grouped = build_grouped_from_base_dir(base_dir)
 
-    model.scaler.fit(data)
-    x = model.scaler.transform(data)
-    y = labels
-
-    model._train_core(x, y, None, None, n_fold=-1, verbose=0)
-
-    sei_df, det_df = evaluate_model_on_data_package(
-        model,
-        x,
-        y,
-        meta_df,
-        grouped,
-        threshold=config["prediction_threshold"],
-        onset_col="onset",
-        offset_col="offset",
-    )
-
-    perf = model_performance(sei_df, det_df)
-    mean_sen = perf["sen"].mean()
-    mean_far = perf["far24"].mean()
-
-    mlflow.log_params(config)
-    mlflow.log_metric("mean_sensitivity", mean_sen)
-    mlflow.log_metric("mean_far24", mean_far)
-
-    return mean_sen, mean_far
-
-
-
-def run_experiment(
-    data: np.ndarray,
-    labels: np.ndarray,
-    meta_df: pd.DataFrame,
-    grouped: Dict
-) -> optuna.Study:
-    mlflow.set_experiment("exp1")
-
-    study = optuna.create_study(
-        directions=["maximize", "minimize"]
-    )
-
+    study = optuna.create_study(directions=["maximize", "minimize"])
     study.optimize(
         lambda t: objective(t, data, labels, meta_df, grouped),
         n_trials=20,
     )
-
     return study
