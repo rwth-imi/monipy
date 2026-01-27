@@ -1,4 +1,4 @@
-# MONIPY – ECG-Based Seizure Detection Pipeline
+# Operationalizing FUTURE-AI Consensus Guideline for Trustworthy Clinical AI: multicenter evidence from wearable ECG seizure detection 
 
 ## Overview
 
